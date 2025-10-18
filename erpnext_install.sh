@@ -16,16 +16,107 @@ YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 LIGHT_BLUE='\033[1;34m'
-NC='\033[0m' 
+NC='\033[0m'
 
 SUPPORTED_DISTRIBUTIONS=("Ubuntu" "Debian")
 SUPPORTED_VERSIONS=("24.04" "23.04" "22.04" "20.04" "12" "11" "10" "9" "8")
 
+OS_NAME=""
+OS_VERSION=""
+IN_CONTAINER=false
+bench_name="frappe-bench"
+
+detect_container_environment() {
+    if [[ -f /.dockerenv || -f /run/.containerenv ]]; then
+        IN_CONTAINER=true
+        return
+    fi
+
+    if grep -qa 'container=' /proc/1/environ 2>/dev/null; then
+        IN_CONTAINER=true
+        return
+    fi
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        if systemd-detect-virt --container >/dev/null 2>&1; then
+            IN_CONTAINER=true
+        fi
+    fi
+}
+
+restart_service() {
+    local service_name="$1"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if sudo systemctl restart "$service_name" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        if sudo service "$service_name" restart >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    if [[ "$IN_CONTAINER" == true ]]; then
+        case "$service_name" in
+            redis-server)
+                pkill -f redis-server >/dev/null 2>&1 || true
+                if command -v redis-server >/dev/null 2>&1; then
+                    redis-server --daemonize yes >/dev/null 2>&1 || true
+                fi
+                echo -e "${YELLOW}Redis service restart handled manually for container environment.${NC}"
+                ;;
+            supervisor)
+                echo -e "${YELLOW}Supervisor service restart skipped (init system not available in container).${NC}"
+                ;;
+            *)
+                echo -e "${YELLOW}Skipping restart of ${service_name}; no compatible service manager detected.${NC}"
+                ;;
+        esac
+        return 0
+    fi
+
+    echo -e "${RED}Unable to restart ${service_name}. Please restart it manually.${NC}"
+    return 0
+}
+
+run_supervisorctl() {
+    if command -v supervisorctl >/dev/null 2>&1; then
+        sudo supervisorctl "$@" || true
+    else
+        echo -e "${YELLOW}supervisorctl not available; skipping: supervisorctl $*${NC}"
+    fi
+}
+
 check_os() {
-    local os_name=$(lsb_release -is)
-    local os_version=$(lsb_release -rs)
+    local os_name=""
+    local os_version=""
     local os_supported=false
     local version_supported=false
+
+    if command -v lsb_release >/dev/null 2>&1; then
+        os_name=$(lsb_release -is)
+        os_version=$(lsb_release -rs)
+    elif [[ -r /etc/os-release ]]; then
+        os_name=$(grep '^ID=' /etc/os-release | cut -d '=' -f2 | tr -d '"')
+        os_version=$(grep '^VERSION_ID=' /etc/os-release | cut -d '=' -f2 | tr -d '"')
+
+        case "$os_name" in
+            ubuntu)
+                os_name="Ubuntu"
+                ;;
+            debian)
+                os_name="Debian"
+                ;;
+        esac
+    fi
+
+    if [[ -z "$os_name" || -z "$os_version" ]]; then
+        echo -e "${RED}Unable to determine operating system information.${NC}"
+        exit 1
+    fi
 
     for i in "${SUPPORTED_DISTRIBUTIONS[@]}"; do
         if [[ "$i" = "$os_name" ]]; then
@@ -45,9 +136,13 @@ check_os() {
         echo -e "${RED}This script is not compatible with your operating system or its version.${NC}"
         exit 1
     fi
+
+    OS_NAME="$os_name"
+    OS_VERSION="$os_version"
 }
 
 check_os
+detect_container_environment
 
 OS="$(uname)"
 case $OS in
@@ -56,11 +151,7 @@ case $OS in
     if [ -f /etc/redhat-release ] ; then
       DISTRO='CentOS'
     elif [ -f /etc/debian_version ] ; then
-      if [ "$(lsb_release -si)" == "Ubuntu" ]; then
-        DISTRO='Ubuntu'
-      else
-        DISTRO='Debian'
-      fi
+      DISTRO="$OS_NAME"
     fi
     ;;
   *) ;;
@@ -332,13 +423,13 @@ check_existing_installations
 # ─── OS COMPATIBILITY FOR VERSION-15 OR DEVELOP ────────────────────────────────────────
 #
 if [[ "$bench_version" == "version-15" || "$bench_version" == "develop" ]]; then
-    if [[ "$(lsb_release -si)" != "Ubuntu" && "$(lsb_release -si)" != "Debian" ]]; then
+    if [[ "$OS_NAME" != "Ubuntu" && "$OS_NAME" != "Debian" ]]; then
         echo -e "${RED}Your Distro is not supported for Version 15/Develop.${NC}"
         exit 1
-    elif [[ "$(lsb_release -si)" == "Ubuntu" && "$(lsb_release -rs)" < "22.04" ]]; then
+    elif [[ "$OS_NAME" == "Ubuntu" && "$OS_VERSION" < "22.04" ]]; then
         echo -e "${RED}Your Ubuntu version is below the minimum required to support Version 15/Develop.${NC}"
         exit 1
-    elif [[ "$(lsb_release -si)" == "Debian" && "$(lsb_release -rs)" < "12" ]]; then
+    elif [[ "$OS_NAME" == "Debian" && "$OS_VERSION" < "12" ]]; then
         echo -e "${RED}Your Debian version is below the minimum required to support Version 15/Develop.${NC}"
         exit 1
     fi
@@ -348,14 +439,14 @@ fi
 # ─── OS COMPATIBILITY FOR OLDER VERSIONS (version-13, version-14) ───────────────────────
 #
 if [[ "$bench_version" != "version-15" && "$bench_version" != "develop" ]]; then
-    if [[ "$(lsb_release -si)" != "Ubuntu" && "$(lsb_release -si)" != "Debian" ]]; then
+    if [[ "$OS_NAME" != "Ubuntu" && "$OS_NAME" != "Debian" ]]; then
         echo -e "${RED}Your Distro is not supported for $version_choice.${NC}"
         exit 1
-    elif [[ "$(lsb_release -si)" == "Ubuntu" && "$(lsb_release -rs)" > "22.04" ]]; then
+    elif [[ "$OS_NAME" == "Ubuntu" && "$OS_VERSION" > "22.04" ]]; then
         echo -e "${RED}Your Ubuntu version is not supported for $version_choice.${NC}"
         echo -e "${YELLOW}ERPNext v13/v14 only support Ubuntu up to 22.04. Please use ERPNext v15 for Ubuntu 24.04.${NC}"
         exit 1
-    elif [[ "$(lsb_release -si)" == "Debian" && "$(lsb_release -rs)" > "11" ]]; then
+    elif [[ "$OS_NAME" == "Debian" && "$OS_VERSION" > "11" ]]; then
         echo -e "${YELLOW}Warning: Your Debian version is above the tested range for $version_choice, but we'll continue.${NC}"
         sleep 2
     fi
@@ -522,7 +613,7 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 
 
-os_version=$(lsb_release -rs)
+os_version="$OS_VERSION"
 if [[ "$DISTRO" == "Ubuntu" && "$os_version" == "24.04" ]]; then
     nvm install 20
     nvm alias default 20
@@ -631,7 +722,7 @@ case "$continue_prod" in
         echo -e "${YELLOW}Installing packages and dependencies for Production...${NC}"
         sleep 2
 
-        yes | sudo bench setup production "$USER" && \
+        yes | sudo bench setup production "$USER"
         echo -e "${YELLOW}Applying necessary permissions to supervisor...${NC}"
         sleep 1
 
@@ -646,8 +737,8 @@ case "$continue_prod" in
             sudo sed -i "5a $SEARCH_PATTERN" "$FILE"
         fi
 
-        sudo service supervisor restart && \
-        yes | sudo bench setup production "$USER" && \
+        restart_service supervisor
+        yes | sudo bench setup production "$USER"
         echo -e "${YELLOW}Enabling Scheduler...${NC}"
         sleep 1
 
@@ -660,7 +751,7 @@ case "$continue_prod" in
             bench setup socketio
             yes | bench setup supervisor
             bench setup redis
-            sudo supervisorctl reload
+            run_supervisorctl reload
         fi
 
         echo -e "${YELLOW}Restarting bench to apply all changes and optimizing environment permissions.${NC}"
@@ -669,10 +760,10 @@ case "$continue_prod" in
         sudo chmod 755 "$(echo $HOME)"
         
         echo -e "${YELLOW}Configuring Redis services...${NC}"
-        sudo systemctl restart redis-server
+        restart_service redis-server
         sleep 2
-        
-        sudo supervisorctl restart all
+
+        run_supervisorctl restart all
         sleep 3
 
         printf "${GREEN}Production setup complete! "
@@ -1196,7 +1287,7 @@ case "$continue_prod" in
                                     
                                     if [ "${#successful_installations[@]}" -gt 0 ]; then
                                         echo -e "${YELLOW}Restarting services to apply changes...${NC}"
-                                        sudo supervisorctl restart all 2>/dev/null || true
+                                        run_supervisorctl restart all
                                         echo -e "${GREEN}Services restarted successfully.${NC}"
                                     fi
                                     fi
