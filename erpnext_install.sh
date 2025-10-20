@@ -71,6 +71,52 @@ restart_service() {
             supervisor)
                 echo -e "${YELLOW}Supervisor service restart skipped (init system not available in container).${NC}"
                 ;;
+            mysql|mariadb)
+                local mysql_socket="/var/run/mysqld/mysqld.sock"
+                pkill -f mariadbd >/dev/null 2>&1 || true
+                pkill -f mysqld_safe >/dev/null 2>&1 || true
+                pkill -f mysqld >/dev/null 2>&1 || true
+                sudo install -d -o mysql -g mysql /run/mysqld >/dev/null 2>&1 || true
+
+                if command -v mysqld_safe >/dev/null 2>&1; then
+                    sudo mysqld_safe --user=mysql \
+                        --datadir=/var/lib/mysql \
+                        --socket="${mysql_socket}" \
+                        --pid-file=/run/mysqld/mysqld.pid \
+                        >/tmp/mysqld_safe.log 2>&1 &
+                    sleep 2
+                elif command -v mariadbd >/dev/null 2>&1; then
+                    sudo mariadbd --user=mysql \
+                        --datadir=/var/lib/mysql \
+                        --socket="${mysql_socket}" \
+                        --pid-file=/run/mysqld/mysqld.pid \
+                        --log-error=/var/log/mysql/error.log \
+                        --skip-name-resolve \
+                        --daemonize >/dev/null 2>&1 || true
+                elif command -v mysqld >/dev/null 2>&1; then
+                    sudo mysqld --user=mysql \
+                        --datadir=/var/lib/mysql \
+                        --socket="${mysql_socket}" \
+                        --pid-file=/run/mysqld/mysqld.pid \
+                        --log-error=/var/log/mysql/error.log \
+                        --skip-name-resolve \
+                        --daemonize >/dev/null 2>&1 || true
+                else
+                    echo -e "${YELLOW}MariaDB binaries not found; unable to manage ${service_name}.${NC}"
+                    return 0
+                fi
+
+                for _ in {1..20}; do
+                    if sudo mysqladmin --socket="${mysql_socket}" --silent --user=root ping >/dev/null 2>&1; then
+                        echo -e "${YELLOW}MariaDB service started manually for container environment.${NC}"
+                        return 0
+                    fi
+                    sleep 1
+                done
+
+                echo -e "${RED}Failed to confirm MariaDB startup in container environment.${NC}"
+                return 0
+                ;;
             *)
                 echo -e "${YELLOW}Skipping restart of ${service_name}; no compatible service manager detected.${NC}"
                 ;;
@@ -88,6 +134,52 @@ run_supervisorctl() {
     else
         echo -e "${YELLOW}supervisorctl not available; skipping: supervisorctl $*${NC}"
     fi
+}
+
+warm_bench_caches() {
+    local bench_dir="$1"
+    local site_name="$2"
+
+    if [[ -z "$bench_dir" || ! -d "$bench_dir" ]]; then
+        echo -e "${YELLOW}Skipping cache warm-up; bench directory '$bench_dir' was not found.${NC}"
+        return
+    fi
+
+    echo -e "${YELLOW}Priming bench caches and assets in $bench_dir for faster container start-up...${NC}"
+
+    pushd "$bench_dir" >/dev/null || return
+
+    if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+        # shellcheck disable=SC1090
+        source "$HOME/.nvm/nvm.sh"
+        nvm use default >/dev/null 2>&1 || true
+    fi
+
+    local warm_steps=(
+        "bench setup requirements --node"
+        "bench setup requirements --python"
+        "bench build"
+    )
+
+    for cmd in "${warm_steps[@]}"; do
+        if eval "$cmd" >/dev/null 2>&1; then
+            echo -e "${GREEN}✓ ${cmd} completed.${NC}"
+        else
+            echo -e "${YELLOW}⚠ ${cmd} did not complete successfully; review logs if start-up issues occur.${NC}"
+        fi
+    done
+
+    if [[ -n "$site_name" ]]; then
+        for cache_cmd in clear-cache clear-website-cache; do
+            if bench --site "$site_name" "$cache_cmd" >/dev/null 2>&1; then
+                echo -e "${GREEN}✓ bench --site $site_name $cache_cmd${NC}"
+            else
+                echo -e "${YELLOW}⚠ bench --site $site_name $cache_cmd encountered a warning.${NC}"
+            fi
+        done
+    fi
+
+    popd >/dev/null || true
 }
 
 check_os() {
@@ -454,7 +546,9 @@ fi
 
 check_os
 
-cd "$(sudo -u $USER echo $HOME)"
+CURRENT_USER="${SUDO_USER:-${USER:-$(whoami)}}"
+HOME_DIR=$(eval echo ~"${CURRENT_USER}")
+cd "$HOME_DIR"
 
 #
 # ─── SQL ROOT PASSWORD PROMPT ─────────────────────────────────────────────────────────
@@ -566,11 +660,35 @@ if [ ! -f "$MARKER_FILE" ]; then
     echo -e "${YELLOW}Now we'll go ahead to apply MariaDB security settings...${NC}"
     sleep 2
 
-    sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$sqlpasswrd';"
-    sudo mysql -u root -p"$sqlpasswrd" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$sqlpasswrd';"
-    sudo mysql -u root -p"$sqlpasswrd" -e "DELETE FROM mysql.user WHERE User='';"
-    sudo mysql -u root -p"$sqlpasswrd" -e "DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
-    sudo mysql -u root -p"$sqlpasswrd" -e "FLUSH PRIVILEGES;"
+    mysql_socket="/var/run/mysqld/mysqld.sock"
+
+    if ! sudo mysqladmin --socket="$mysql_socket" --silent --user=root ping >/dev/null 2>&1; then
+        restart_service mysql || true
+        restart_service mariadb || true
+
+        if ! sudo mysqladmin --socket="$mysql_socket" --silent --user=root ping >/dev/null 2>&1; then
+            echo -e "${RED}MariaDB is not running; please review the service status before retrying.${NC}"
+            exit 1
+        fi
+    fi
+
+    mysql_args=(--connect-expired-password -u root -p"$sqlpasswrd" --socket="$mysql_socket")
+    if ! sudo mysql "${mysql_args[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
+        mysql_args=(--connect-expired-password -u root --socket="$mysql_socket")
+        if sudo mysql "${mysql_args[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
+            sudo mysql "${mysql_args[@]}" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$sqlpasswrd';"
+            mysql_args=(--connect-expired-password -u root -p"$sqlpasswrd" --socket="$mysql_socket")
+        else
+            echo -e "${RED}Unable to authenticate with MariaDB using the provided credentials.${NC}"
+            exit 1
+        fi
+    else
+        sudo mysql "${mysql_args[@]}" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$sqlpasswrd';"
+    fi
+
+    sudo mysql "${mysql_args[@]}" -e "DELETE FROM mysql.user WHERE User='';"
+    sudo mysql "${mysql_args[@]}" -e "DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
+    sudo mysql "${mysql_args[@]}" -e "FLUSH PRIVILEGES;"
 
     echo -e "${YELLOW}...And add some settings to /etc/mysql/my.cnf:${NC}"
     sleep 2
@@ -585,7 +703,8 @@ collation-server = utf8mb4_unicode_ci
 default-character-set = utf8mb4
 EOF'
 
-    sudo service mysql restart
+    restart_service mysql
+    restart_service mariadb
 
     touch "$MARKER_FILE"
     echo -e "${GREEN}MariaDB settings done!${NC}"
@@ -1302,6 +1421,8 @@ case "$continue_prod" in
                 ;;
         esac
 
+        warm_bench_caches "$bench_name" "$site_name"
+
         #
         # ─── SSL SECTION ────────────────────────────────────────────────────────────────
         #
@@ -1376,7 +1497,7 @@ case "$continue_prod" in
             nvm alias default 16
         fi
         bench use "$site_name"
-        bench build
+        warm_bench_caches "$bench_name" "$site_name"
         echo -e "${GREEN}Done!${NC}"
         sleep 5
 
